@@ -350,6 +350,7 @@ def _write_group_xlsx(
 
     # ── Автофильтр ────────────────────────────────────────────
     ws.auto_filter.ref = f"A4:{last_col_letter}4"
+    ws.freeze_panes = "A5"
 
     tmp = out_path + ".tmp"
     try:

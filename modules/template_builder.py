@@ -324,6 +324,7 @@ def _update_existing_template(
 
     last_col = get_column_letter(ws.max_column)
     ws.auto_filter.ref = f"A4:{last_col}4"
+    ws.freeze_panes = "A5"
 
     tmp_path = output_path + ".tmp"
     try:
@@ -422,6 +423,7 @@ def build_template(
             _set_row_heights(ws)
             last_col = get_column_letter(ws.max_column)
             ws.auto_filter.ref = f"A4:{last_col}4"
+            ws.freeze_panes = "A5"
             wb.save(tmp_path)
         finally:
             try:
