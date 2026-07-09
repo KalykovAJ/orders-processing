@@ -97,7 +97,7 @@ def process_orders(root_folder: str, refs: dict, networks: dict):
         # устаревший шаблон, если тот остался с прошлого раза (иначе
         # шаблон без единой заявки продолжал бы висеть на диске вечно).
         has_orders = any(
-            f.endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_")
+            f.lower().endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_")
             for f in os.listdir(net_folder)
             if os.path.isfile(os.path.join(net_folder, f))
         )

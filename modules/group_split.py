@@ -374,7 +374,7 @@ def _collect_current_files(root_folder: str, networks: dict) -> dict:
             continue
         files = []
         for f in os.listdir(net_folder):
-            if f.endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
+            if f.lower().endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
                 files.append(f)
         if files:
             result[net_code] = sorted(files)

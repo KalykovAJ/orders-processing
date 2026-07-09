@@ -117,7 +117,7 @@ def find_unsynced_orders(root_folder: str, networks: dict) -> dict:
             continue
         files = current_files.setdefault(net_code, set())
         for f in os.listdir(net_folder):
-            if f.endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
+            if f.lower().endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
                 files.add(f)
 
     deleted = []
@@ -156,7 +156,7 @@ def prune_deleted_files(root_folder: str, networks: dict):
             continue
         files = current_files.setdefault(net_code, set())
         for f in os.listdir(net_folder):
-            if f.endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
+            if f.lower().endswith((".xlsx", ".xlsm", ".xls")) and not f.lower().startswith("шаблон_"):
                 files.add(f)
 
     changed = False

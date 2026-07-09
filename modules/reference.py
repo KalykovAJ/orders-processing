@@ -42,7 +42,7 @@ def load_all_references() -> dict:
         raise FileNotFoundError(f"Папка справочников не найдена: {REFERENCE_DIR}")
 
     for fname in os.listdir(REFERENCE_DIR):
-        if not (fname.endswith(".xlsx") or fname.endswith(".xlsm")):
+        if not fname.lower().endswith((".xlsx", ".xlsm")):
             continue
         fpath = os.path.join(REFERENCE_DIR, fname)
         try:

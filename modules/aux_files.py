@@ -24,7 +24,7 @@ def _get_azs_sheet_names_by_net(root_folder: str, network_mapping: dict, selecte
 
         names = set()
         for f in os.listdir(net_folder):
-            if not f.endswith((".xlsx", ".xlsm", ".xls")):
+            if not f.lower().endswith((".xlsx", ".xlsm", ".xls")):
                 continue
             if _is_template_file(f, net_code):
                 continue

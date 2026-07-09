@@ -38,7 +38,7 @@ def get_azs_files(network_folder: str) -> list:
     if not os.path.isdir(network_folder):
         return files
     for f in os.listdir(network_folder):
-        if f.endswith((".xlsx", ".xlsm", ".xls")):
+        if f.lower().endswith((".xlsx", ".xlsm", ".xls")):
             files.append(os.path.join(network_folder, f))
     return files
 
