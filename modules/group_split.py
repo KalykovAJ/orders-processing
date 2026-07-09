@@ -416,7 +416,7 @@ def _filter_azs_for_new_files(azs_headers: list, new_files: dict, net_code: str,
             if azs_lower == f"азс{key}" or azs_lower == f"азс {key}":
                 matched_indices.append(ai)
                 break
-            if azs_suffix == key or key.endswith(azs_suffix) or azs_suffix.endswith(key):
+            if azs_suffix == key:
                 matched_indices.append(ai)
                 break
             azs_digits = "".join(c for c in azs_lower if c.isdigit())
