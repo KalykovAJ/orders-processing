@@ -236,6 +236,29 @@ def _update_existing_template(
         а имя файла осталось прежним (см. changed_files) — иначе такую
         замену не ловит diff по заголовкам колонок, и старые цифры
         оставались бы в шаблоне навсегда.
+
+    ФИКС «съезжающих» количеств: раньше строки товаров (колонки 1-4:
+    №/Наименование/Группа/Вес, строки 5+) при обновлении шаблона вообще
+    не проверялись и не трогались — обновлялись только колонки АЗС
+    (5+). Количество же читается из заявочника и пишется в строку по
+    порядковому номеру позиции в ТЕКУЩЕМ items_df (см. _fill_azs_column).
+    Если состав или порядок позиций в справочнике менялся (добавили
+    товар не в конец, убрали из середины, изменили сортировку/фильтр
+    и т.п.), нумерация строк в уже сохранённом файле и в items_df
+    расходилась — и количество, реально относящееся к одной позиции,
+    записывалось в строку с подписью совсем другой позиции.
+
+    Теперь перед обновлением строки 5+ (колонка «Наименование») уже
+    сохранённого файла сверяются с текущим items_df. Если расхождений
+    нет — работаем как раньше, без изменений в логике. Если состав/
+    порядок разошёлся — строки 1-4 и ВСЕ колонки АЗС (не только новые/
+    изменённые) пересобираются заново из items_df и заявочников, чтобы
+    количество гарантированно легло на правильную строку. Частичный
+    перенос старых чисел по имени сюда намеренно не добавлен: как
+    только нумерация строк разошлась, доверять позиции старых ячеек
+    нельзя, а точечное сопоставление по имени добавило бы ещё один
+    источник багов вместо того, чтобы его убрать.
+
     Возвращает (added_set, removed_set, refreshed_set) — имена файлов.
     """
     changed_files = changed_files or set()
@@ -253,6 +276,18 @@ def _update_existing_template(
             ws.delete_cols(col_idx)
             break
 
+    # ── проверяем, не разошлась ли нумерация строк товаров ────
+    # (см. докстринг выше — сравниваем текущий items_df со строками,
+    # реально записанными в файле сейчас)
+    current_names = [str(row.get(COL_NAME, "")).strip() for _, row in items_df.iterrows()]
+    existing_names = []
+    for r in range(5, ws.max_row + 1):
+        val = ws.cell(row=r, column=2).value
+        existing_names.append(str(val).strip() if val is not None else "")
+    while existing_names and existing_names[-1] == "":
+        existing_names.pop()  # хвостовые пустые строки формата не считаем расхождением
+    rows_realigned = existing_names != current_names
+
     # ── считываем уже существующие колонки АЗС из строки 4 ──
     existing_azs: dict[str, int] = {}   # {col_header: col_idx}
     for col_idx in range(5, ws.max_column + 1):
@@ -266,52 +301,88 @@ def _update_existing_template(
 
     added_files: set = set()
     removed_files: set = set()
+    refreshed_files: set = set()
 
-    # ── удаляем колонки исчезнувших заявок ───────────────────
-    if to_remove:
-        # Удаляем столбцы справа налево, чтобы индексы не сдвигались
-        cols_to_del = sorted(
-            [existing_azs[h] for h in to_remove], reverse=True
-        )
-        for col_idx in cols_to_del:
-            ws.delete_cols(col_idx)
-            removed_files.add(existing_azs[
-                next(h for h, ci in existing_azs.items() if ci == col_idx)
-            ])
-        # Пересчитываем existing_azs после удалений
-        existing_azs = {}
-        for col_idx in range(5, ws.max_column + 1):
-            val = ws.cell(row=4, column=col_idx).value
-            if val:
-                existing_azs[str(val)] = col_idx
-        # Собираем имена файлов для лога
+    if rows_realigned:
+        # ── строки товаров расходятся со справочником: полная,
+        # предсказуемая пересборка (см. докстринг) ────────────
+        print(f"    [!] {network_code}: состав/порядок позиций в справочнике "
+              f"изменился — строки шаблона и количества по всем заявкам "
+              f"пересобираются заново, чтобы числа не съехали на другие позиции.")
+
+        added_files = {os.path.basename(fpath_by_header[h]) for h in to_add}
         removed_files = {h.replace("АЗС", "") for h in to_remove}
+        kept_headers = [h for h in current_headers if h not in to_add]
+        refreshed_files = {os.path.basename(fpath_by_header[h]) for h in kept_headers}
 
-    # ── обновляем колонки, чьё содержимое изменилось на диске ──
-    # (тот же файл заменили новым с другими цифрами — заголовок
-    # колонки не меняется, поэтому его не ловят to_add/to_remove)
-    to_refresh = [
-        h for h in current_headers
-        if h in existing_azs and h not in to_add
-        and os.path.basename(fpath_by_header[h]) in changed_files
-    ]
-    for col_header in to_refresh:
-        fpath = fpath_by_header[col_header]
-        col_idx = existing_azs[col_header]
-        _fill_azs_column(ws, items_df, fpath, col_idx, style)
-    refreshed_files = {os.path.basename(fpath_by_header[h]) for h in to_refresh}
+        # сносим все колонки АЗС и все строки товаров
+        for col_idx in range(ws.max_column, 4, -1):
+            ws.delete_cols(col_idx)
+        for r in range(ws.max_row, 4, -1):
+            ws.delete_rows(r)
 
-    # ── добавляем новые колонки АЗС ──────────────────────────
-    for col_header in to_add:
-        fpath = fpath_by_header[col_header]
-        next_col = ws.max_column + 1
-        existing_azs[col_header] = next_col
-        cell = ws.cell(row=4, column=next_col, value=col_header)
-        cell.fill = _fill(style["col_header_fill"])
-        cell.font = _font(style["col_header_font"], bold=True)
-        cell.alignment = _align()
-        _fill_azs_column(ws, items_df, fpath, next_col, style)
-        added_files.add(os.path.basename(fpath))
+        # заново пишем строки 1-4 (шапка + Наименование/Группа/Вес)
+        _write_header(ws, network_code, style, items_df)
+
+        # заново читаем количество из ВСЕХ текущих заявочников
+        existing_azs = {}
+        for fpath, azs_num in filtered_azs:
+            col_header = f"АЗС{azs_num}"
+            if col_header not in existing_azs:
+                next_col = ws.max_column + 1
+                existing_azs[col_header] = next_col
+                cell = ws.cell(row=4, column=next_col, value=col_header)
+                cell.fill = _fill(style["col_header_fill"])
+                cell.font = _font(style["col_header_font"], bold=True)
+                cell.alignment = _align()
+            _fill_azs_column(ws, items_df, fpath, existing_azs[col_header], style)
+
+    else:
+        # ── удаляем колонки исчезнувших заявок ───────────────────
+        if to_remove:
+            # Удаляем столбцы справа налево, чтобы индексы не сдвигались
+            cols_to_del = sorted(
+                [existing_azs[h] for h in to_remove], reverse=True
+            )
+            for col_idx in cols_to_del:
+                ws.delete_cols(col_idx)
+                removed_files.add(existing_azs[
+                    next(h for h, ci in existing_azs.items() if ci == col_idx)
+                ])
+            # Пересчитываем existing_azs после удалений
+            existing_azs = {}
+            for col_idx in range(5, ws.max_column + 1):
+                val = ws.cell(row=4, column=col_idx).value
+                if val:
+                    existing_azs[str(val)] = col_idx
+            # Собираем имена файлов для лога
+            removed_files = {h.replace("АЗС", "") for h in to_remove}
+
+        # ── обновляем колонки, чьё содержимое изменилось на диске ──
+        # (тот же файл заменили новым с другими цифрами — заголовок
+        # колонки не меняется, поэтому его не ловят to_add/to_remove)
+        to_refresh = [
+            h for h in current_headers
+            if h in existing_azs and h not in to_add
+            and os.path.basename(fpath_by_header[h]) in changed_files
+        ]
+        for col_header in to_refresh:
+            fpath = fpath_by_header[col_header]
+            col_idx = existing_azs[col_header]
+            _fill_azs_column(ws, items_df, fpath, col_idx, style)
+        refreshed_files = {os.path.basename(fpath_by_header[h]) for h in to_refresh}
+
+        # ── добавляем новые колонки АЗС ──────────────────────────
+        for col_header in to_add:
+            fpath = fpath_by_header[col_header]
+            next_col = ws.max_column + 1
+            existing_azs[col_header] = next_col
+            cell = ws.cell(row=4, column=next_col, value=col_header)
+            cell.fill = _fill(style["col_header_fill"])
+            cell.font = _font(style["col_header_font"], bold=True)
+            cell.alignment = _align()
+            _fill_azs_column(ws, items_df, fpath, next_col, style)
+            added_files.add(os.path.basename(fpath))
 
     # ── пересоздаём колонку ИТОГО сразу после последней АЗС ──
     _apply_total_column(ws, style)
