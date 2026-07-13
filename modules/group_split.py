@@ -153,23 +153,49 @@ class _ExcelSession:
             self._available = False
         return self._available
 
-    def convert(self, xlsx_path: str, xls_path: str) -> bool:
+    # Коды COM-ошибок, при которых Excel просто временно занят
+    # (например, ещё не отпустил предыдущий файл) — имеет смысл
+    # подождать и повторить, а не сразу сдаваться в .xlsx.
+    _TRANSIENT_HRESULTS = {
+        -2147418111,  # RPC_E_CALL_REJECTED  — «Вызов отклонен вызываемым объектом»
+        -2147417846,  # RPC_E_SERVERCALL_RETRYLATER
+    }
+
+    def convert(self, xlsx_path: str, xls_path: str, retries: int = 3, delay: float = 1.0) -> bool:
         if not self._ensure():
             return False
-        try:
-            wb = self.excel.Workbooks.Open(os.path.abspath(xlsx_path))
+        import pythoncom
+        import time
+
+        last_err = None
+        for attempt in range(1, retries + 1):
             try:
-                wb.SaveAs(os.path.abspath(xls_path), FileFormat=56)
-            finally:
-                wb.Close(False)
-            try:
-                os.remove(xlsx_path)
-            except OSError:
-                pass
-            return True
-        except Exception as e:
-            print(f"  [!] win32com: {e} — файл оставлен как .xlsx")
-            return False
+                wb = self.excel.Workbooks.Open(os.path.abspath(xlsx_path))
+                try:
+                    wb.SaveAs(os.path.abspath(xls_path), FileFormat=56)
+                finally:
+                    wb.Close(False)
+                try:
+                    os.remove(xlsx_path)
+                except OSError:
+                    pass
+                return True
+            except Exception as e:
+                last_err = e
+                hresult = getattr(e, "hresult", None) or (e.args[0] if e.args else None)
+                if hresult in self._TRANSIENT_HRESULTS and attempt < retries:
+                    # даём Excel «отдышаться»: прокачиваем очередь COM-сообщений
+                    # и ждём перед повторной попыткой
+                    try:
+                        pythoncom.PumpWaitingMessages()
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+                    continue
+                break
+
+        print(f"  [!] win32com: {last_err} — файл оставлен как .xlsx")
+        return False
 
     def close(self):
         if self.excel is not None:
