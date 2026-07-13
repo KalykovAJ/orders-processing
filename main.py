@@ -23,7 +23,7 @@ from modules.template_builder import build_template
 from modules.tonnage import calculate_tonnage
 from modules.group_split import split_by_groups
 from modules.aux_files import create_or_update_nedovoz, create_or_update_spisok
-from modules.state import find_unsynced_orders, prune_deleted_files
+from modules.state import prune_deleted_files
 
 
 def choose_folder() -> str:
@@ -186,38 +186,6 @@ def process_group_split(root_folder: str, networks: dict, skip_check: bool = Fal
         return  # Прервано из-за необработанных заявок — уже выведено предупреждение
 
 
-def _block_if_unsynced_orders(root_folder: str, networks: dict) -> bool:
-    """Проверяет рассинхронизацию заявок с диском. Блокирует операцию
-    только если есть УДАЛЁННЫЕ заявки — для них на диске остаются
-    «осиротевшие» части/тоннаж, и это нужно явно пересобрать через п.1.
-
-    Новые заявки сюда не блокируются: их корректно отличает «опер.1 ещё
-    не запускалась» от «опер.1 уже обработала файл» сама split_by_groups
-    (по наличию столбца АЗС в шаблоне) — дублирующая грубая проверка здесь
-    раньше блокировала и уже обработанные операцией 1 новые заявки
-    бесконечно, т.к. в реестр частей они попадают только внутри самой
-    операции 2, которая этим же блоком и не пускалась.
-
-    Если одновременно есть и удалённые, и новые заявки, обе группы
-    показываются в сообщении — раньше печатались только удалённые, и было
-    непонятно, что есть ещё и необработанные новые."""
-    result = find_unsynced_orders(root_folder, networks)
-    deleted, new = result["deleted"], result["new"]
-    if not deleted:
-        return False
-
-    print("\n[!] Заявки удалены с диска, но ещё числятся в обработанных частях:")
-    for m in deleted:
-        print(f"      • {m}")
-    if new:
-        print("\n[i] Также есть новые заявки, ещё не обработанные операцией 1:")
-        for m in new:
-            print(f"      • {m}")
-    print("\n[!] Запустите «Запустить все операции», либо выполните операции")
-    print("    по очереди начиная с п.1 «Обработать заявки и собрать шаблоны».")
-    return True
-
-
 def main():
     print("\n" + "="*50)
     print("  СИСТЕМА ОБРАБОТКИ ЗАЯВОК АЗС")
@@ -246,10 +214,7 @@ def main():
         action = menu(
             "Главное меню",
             [
-                "Обработать заявки и собрать шаблоны",
-                "Разделить шаблоны по группам (1С)",
-                "Посчитать тоннаж",
-                "Запустить все операции",
+                "Обработать заявки",
                 "Выход",
             ]
         )
@@ -260,17 +225,7 @@ def main():
 
         # Меню выбора сети удалено — всегда работаем со всеми сетями
         if action.startswith("Обработать"):
-            process_orders(root_folder, refs, networks)
-        elif action.startswith("Разделить"):
-            if _block_if_unsynced_orders(root_folder, networks):
-                continue
-            process_group_split(root_folder, networks)
-        elif action.startswith("Посчитать"):
-            if _block_if_unsynced_orders(root_folder, networks):
-                continue
-            process_tonnage(root_folder, networks)
-        elif action.startswith("Запустить"):
-            print("\n[>>] Запуск всех операций для всех сетей...")
+            print("\n[>>] Обработка заявок для всех сетей...")
             print("\n--- 1/3 Обработка заявок ---")
             # Недовоз/Список синхронизируются здесь же (внутри process_orders)
             process_orders(root_folder, refs, networks)
