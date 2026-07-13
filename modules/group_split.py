@@ -144,12 +144,27 @@ class _ExcelSession:
             import win32com.client
             import pythoncom
             pythoncom.CoInitialize()
-            self.excel = win32com.client.Dispatch("Excel.Application")
+            # DispatchEx (а не Dispatch!) — принудительно создаёт НОВЫЙ, изолированный
+            # процесс Excel. Обычный Dispatch() может подцепиться к уже запущенному
+            # Excel пользователя (через Running Object Table), и тогда автоматизация
+            # начинает конфликтовать с тем, чем человек занят в интерфейсе в этот
+            # момент — отсюда нестабильные "Вызов был отклонен" (RPC_E_CALL_REJECTED)
+            # на некоторых машинах.
+            self.excel = win32com.client.DispatchEx("Excel.Application")
             self.excel.Visible = False
             self.excel.DisplayAlerts = False
+            self.excel.Interactive = False
+            self.excel.ScreenUpdating = False
+            self.excel.EnableEvents = False
+            try:
+                # Не у всех версий/сборок Excel есть это свойство — не критично.
+                self.excel.AskToUpdateLinks = False
+            except Exception:
+                pass
             self._available = True
         except Exception as e:
             print(f"  [!] pywin32 не найден ({e}) — файлы будут сохранены в .xlsx")
+            self.excel = None
             self._available = False
         return self._available
 
@@ -161,7 +176,7 @@ class _ExcelSession:
         -2147417846,  # RPC_E_SERVERCALL_RETRYLATER
     }
 
-    def convert(self, xlsx_path: str, xls_path: str, retries: int = 3, delay: float = 1.0) -> bool:
+    def convert(self, xlsx_path: str, xls_path: str, retries: int = 5, delay: float = 1.5) -> bool:
         if not self._ensure():
             return False
         import pythoncom
