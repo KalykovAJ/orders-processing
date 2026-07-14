@@ -15,14 +15,13 @@
 # ============================================================
 import os
 import re
-import copy
 import shutil
 import stat
 import time
 import hashlib
 
-from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import xlwt
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from config.settings import (
@@ -30,6 +29,7 @@ from config.settings import (
     GROUP_ORDER, GROUP_ORDER_TAIL,
 )
 from modules.state import load_state, save_state
+from modules.xls_writer import XlsStyleBuilder, col_width_xls, row_height_xls
 
 
 # ── надёжное удаление папки ───────────────────────────────────
@@ -110,122 +110,6 @@ def _sort_groups(groups: list) -> list:
     return body_sorted + tail_sorted
 
 
-# ── копирование стиля ячейки ──────────────────────────────────
-
-def _copy_cell_style(src_cell, dst_cell):
-    if src_cell.has_style:
-        dst_cell.font = copy.copy(src_cell.font)
-        dst_cell.fill = copy.copy(src_cell.fill)
-        dst_cell.border = copy.copy(src_cell.border)
-        dst_cell.alignment = copy.copy(src_cell.alignment)
-        dst_cell.number_format = src_cell.number_format
-        dst_cell.protection = copy.copy(src_cell.protection)
-
-
-# ── конвертация xlsx → xls через Excel (win32com) ────────────
-#
-# ОПТИМИЗАЦИЯ: раньше Excel.Application запускался и закрывался
-# заново на КАЖДЫЙ файл (это секунды накладных расходов на файл).
-# Теперь используется одна общая сессия Excel на весь прогон
-# split_by_groups — она открывается один раз и закрывается в конце.
-
-class _ExcelSession:
-    """Держит одно запущенное приложение Excel для пакетной конвертации
-    xlsx → xls. Драматически быстрее, чем поднимать Excel на каждый файл."""
-
-    def __init__(self):
-        self.excel = None
-        self._available = None  # None = ещё не проверяли
-
-    def _ensure(self) -> bool:
-        if self._available is not None:
-            return self._available
-        try:
-            import win32com.client
-            import pythoncom
-            pythoncom.CoInitialize()
-            # DispatchEx (а не Dispatch!) — принудительно создаёт НОВЫЙ, изолированный
-            # процесс Excel. Обычный Dispatch() может подцепиться к уже запущенному
-            # Excel пользователя (через Running Object Table), и тогда автоматизация
-            # начинает конфликтовать с тем, чем человек занят в интерфейсе в этот
-            # момент — отсюда нестабильные "Вызов был отклонен" (RPC_E_CALL_REJECTED)
-            # на некоторых машинах.
-            self.excel = win32com.client.DispatchEx("Excel.Application")
-            self.excel.Visible = False
-            self.excel.DisplayAlerts = False
-            self.excel.Interactive = False
-            self.excel.ScreenUpdating = False
-            self.excel.EnableEvents = False
-            try:
-                # Не у всех версий/сборок Excel есть это свойство — не критично.
-                self.excel.AskToUpdateLinks = False
-            except Exception:
-                pass
-            self._available = True
-        except Exception as e:
-            print(f"  [!] pywin32 не найден ({e}) — файлы будут сохранены в .xlsx")
-            self.excel = None
-            self._available = False
-        return self._available
-
-    # Коды COM-ошибок, при которых Excel просто временно занят
-    # (например, ещё не отпустил предыдущий файл) — имеет смысл
-    # подождать и повторить, а не сразу сдаваться в .xlsx.
-    _TRANSIENT_HRESULTS = {
-        -2147418111,  # RPC_E_CALL_REJECTED  — «Вызов отклонен вызываемым объектом»
-        -2147417846,  # RPC_E_SERVERCALL_RETRYLATER
-    }
-
-    def convert(self, xlsx_path: str, xls_path: str, retries: int = 5, delay: float = 1.5) -> bool:
-        if not self._ensure():
-            return False
-        import pythoncom
-        import time
-
-        last_err = None
-        for attempt in range(1, retries + 1):
-            try:
-                wb = self.excel.Workbooks.Open(os.path.abspath(xlsx_path))
-                try:
-                    wb.SaveAs(os.path.abspath(xls_path), FileFormat=56)
-                finally:
-                    wb.Close(False)
-                try:
-                    os.remove(xlsx_path)
-                except OSError:
-                    pass
-                return True
-            except Exception as e:
-                last_err = e
-                hresult = getattr(e, "hresult", None) or (e.args[0] if e.args else None)
-                if hresult in self._TRANSIENT_HRESULTS and attempt < retries:
-                    # даём Excel «отдышаться»: прокачиваем очередь COM-сообщений
-                    # и ждём перед повторной попыткой
-                    try:
-                        pythoncom.PumpWaitingMessages()
-                    except Exception:
-                        pass
-                    time.sleep(delay)
-                    continue
-                break
-
-        print(f"  [!] win32com: {last_err} — файл оставлен как .xlsx")
-        return False
-
-    def close(self):
-        if self.excel is not None:
-            try:
-                self.excel.Quit()
-            except Exception:
-                pass
-            self.excel = None
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
-
 # ── MD5-хэш файла (быстро, читаем блоками) ───────────────────
 
 def _file_md5(path: str) -> str:
@@ -277,130 +161,129 @@ def _read_template_data(ws) -> dict:
     }
 
 
-# ── запись xlsx (openpyxl) с полным копированием стилей ───────
+# ── запись .xls (xlwt) напрямую, с переносом стилей ────────────
+#
+# Раньше файл сначала собирался как .xlsx через openpyxl, а затем
+# конвертировался в .xls живым процессом Excel (win32com). Теперь
+# xlwt пишет .xls сразу, без промежуточного файла и без Excel: стиль
+# каждой ячейки (шрифт/заливка/границы/выравнивание) берётся из
+# исходной openpyxl-ячейки шаблона-источника через XlsStyleBuilder.
 
-def _write_group_xlsx(
+def _write_group_xls(
         out_path: str,
         tpl_data: dict,
         group_rows: list,
         keep_azs_indices: list,
-        style_cfg: dict,
         ws_src,
 ):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Лист1"
+    wb = xlwt.Workbook(encoding="utf-8")
+    ws = wb.add_sheet("Лист1")
+    style_builder = XlsStyleBuilder(wb)
 
     azs_headers = tpl_data["azs_headers"]
     total_col_idx = tpl_data.get("total_col_idx")
     header_cells = tpl_data["header_cells"]
     title_cell = tpl_data["title_cell"]
     has_total = total_col_idx is not None
-    total_cols = 4 + len(keep_azs_indices) + (1 if has_total else 0)
+    total_cols = 4 + len(keep_azs_indices) + (1 if has_total else 0)  # 1-based кол-во колонок
 
-    # ── Строки 1-3: объединённый заголовок ───────────────────
-    last_col_letter = get_column_letter(total_cols)
-    ws.merge_cells(f"A1:{last_col_letter}3")
-    dst_title = ws.cell(row=1, column=1)
-    dst_title.value = title_cell.value
-    _copy_cell_style(title_cell, dst_title)
+    # ── Строки 1-3: объединённый заголовок (xlwt — индексы с 0) ──
+    title_style = style_builder.style_for_cell(title_cell)
+    ws.write_merge(0, 2, 0, total_cols - 1, title_cell.value, title_style)
 
-    # ── Строка 4: шапка таблицы ───────────────────────────────
+    # ── Строка 4 (индекс 3): шапка таблицы ─────────────────────
     for c_idx, val, src_cell in header_cells[:4]:
-        dst = ws.cell(row=4, column=c_idx, value=val)
-        _copy_cell_style(src_cell, dst)
+        ws.write(3, c_idx - 1, val, style_builder.style_for_cell(src_cell))
 
     for out_col, ai in enumerate(keep_azs_indices, start=5):
         orig_col_idx, azs_name = azs_headers[ai]
         src_cell = ws_src.cell(row=4, column=orig_col_idx)
-        dst = ws.cell(row=4, column=out_col, value=azs_name)
-        _copy_cell_style(src_cell, dst)
+        ws.write(3, out_col - 1, azs_name, style_builder.style_for_cell(src_cell))
 
-    total_out_col = 5 + len(keep_azs_indices)  # первая колонка после последней АЗС
+    total_out_col = 5 + len(keep_azs_indices)  # 1-based, первая колонка после последней АЗС
     if has_total:
         src_total_header = ws_src.cell(row=4, column=total_col_idx)
-        dst = ws.cell(row=4, column=total_out_col, value=TEMPLATE_TOTAL_HEADER)
-        _copy_cell_style(src_total_header, dst)
+        ws.write(3, total_out_col - 1, TEMPLATE_TOTAL_HEADER, style_builder.style_for_cell(src_total_header))
 
     # ── Строки данных ─────────────────────────────────────────
     first_azs_letter = "E"
     last_azs_letter = get_column_letter(4 + len(keep_azs_indices))
+    blank_style = xlwt.XFStyle()
     for out_row, row_info in enumerate(group_rows, start=5):
+        r0 = out_row - 1
         orig_cells = {c_idx: (val, src_cell) for c_idx, val, src_cell in row_info["cells"]}
 
         for c_idx in range(1, 5):
             val, src_cell = orig_cells.get(c_idx, (None, None))
-            dst = ws.cell(row=out_row, column=c_idx, value=val)
-            if src_cell:
-                _copy_cell_style(src_cell, dst)
+            style = style_builder.style_for_cell(src_cell) if src_cell is not None else blank_style
+            ws.write(r0, c_idx - 1, val, style)
 
         for out_col, ai in enumerate(keep_azs_indices, start=5):
             orig_col_idx, _ = azs_headers[ai]
             val, src_cell = orig_cells.get(orig_col_idx, (None, None))
-            dst = ws.cell(row=out_row, column=out_col, value=val)
-            if src_cell:
-                _copy_cell_style(src_cell, dst)
+            style = style_builder.style_for_cell(src_cell) if src_cell is not None else blank_style
+            ws.write(r0, out_col - 1, val, style)
 
         if has_total:
             # Сумма считается только по колонкам АЗС, реально попавшим в
             # этот файл (а не по всем АЗС шаблона) — иначе цифра была бы
             # некорректной для конкретной части/группы.
             _, src_total_cell = orig_cells.get(total_col_idx, (None, None))
-            formula = f"=SUM({first_azs_letter}{out_row}:{last_azs_letter}{out_row})"
-            dst = ws.cell(row=out_row, column=total_out_col, value=formula)
-            if src_total_cell:
-                _copy_cell_style(src_total_cell, dst)
-            dst.number_format = "0"
+            formula = f"SUM({first_azs_letter}{out_row}:{last_azs_letter}{out_row})"
+            if src_total_cell is not None:
+                style = style_builder.style_for_cell(src_total_cell, number_format_override="0")
+            else:
+                style = xlwt.XFStyle()
+                style.num_format_str = "0"
+            ws.write(r0, total_out_col - 1, xlwt.Formula(formula), style)
 
     # ── Ширина колонок ────────────────────────────────────────
     for c_idx in range(1, 5):
         letter = get_column_letter(c_idx)
         src_dim = ws_src.column_dimensions.get(letter)
-        if src_dim and src_dim.width:
-            ws.column_dimensions[letter].width = src_dim.width
+        width = src_dim.width if src_dim and src_dim.width else None
+        ws.col(c_idx - 1).width = col_width_xls(width)
 
     for out_col, ai in enumerate(keep_azs_indices, start=5):
         orig_col_idx, azs_name = azs_headers[ai]
         src_dim = ws_src.column_dimensions.get(get_column_letter(orig_col_idx))
-        letter = get_column_letter(out_col)
-        if src_dim and src_dim.width:
-            ws.column_dimensions[letter].width = src_dim.width
-        else:
-            ws.column_dimensions[letter].width = max(len(azs_name) + 2, 10)
+        width = src_dim.width if src_dim and src_dim.width else max(len(azs_name) + 2, 10)
+        ws.col(out_col - 1).width = col_width_xls(width)
 
     if has_total:
-        letter = get_column_letter(total_out_col)
         src_dim = ws_src.column_dimensions.get(get_column_letter(total_col_idx))
-        if src_dim and src_dim.width:
-            ws.column_dimensions[letter].width = src_dim.width
-        else:
-            ws.column_dimensions[letter].width = max(len(TEMPLATE_TOTAL_HEADER) + 2, 10)
+        width = src_dim.width if src_dim and src_dim.width else max(len(TEMPLATE_TOTAL_HEADER) + 2, 10)
+        ws.col(total_out_col - 1).width = col_width_xls(width)
 
     # ── Высота строк ──────────────────────────────────────────
     for r in range(1, 4):
         src_h = ws_src.row_dimensions[r].height
-        ws.row_dimensions[r].height = src_h if src_h else 15
+        row = ws.row(r - 1)
+        row.height = row_height_xls(src_h if src_h else 15)
+        row.height_mismatch = True
 
     src_h4 = ws_src.row_dimensions[4].height
-    ws.row_dimensions[4].height = src_h4 if src_h4 else 30
+    row4 = ws.row(3)
+    row4.height = row_height_xls(src_h4 if src_h4 else 30)
+    row4.height_mismatch = True
 
     for out_row, row_info in enumerate(group_rows, start=5):
         orig_row_idx = row_info["row_idx"]
         src_h = ws_src.row_dimensions[orig_row_idx].height
-        ws.row_dimensions[out_row].height = src_h if src_h else 19
+        row = ws.row(out_row - 1)
+        row.height = row_height_xls(src_h if src_h else 19)
+        row.height_mismatch = True
 
-    # ── Автофильтр ────────────────────────────────────────────
-    ws.auto_filter.ref = f"A4:{last_col_letter}4"
-    ws.freeze_panes = "A5"
+    # ── Заморозка шапки (аналог freeze_panes = "A5") ──────────
+    # Примечание: автофильтр из openpyxl-версии в .xls через xlwt не
+    # поддерживается (ограничение библиотеки) — на данные и печать
+    # это не влияет.
+    ws.set_panes_frozen(True)
+    ws.set_horz_split_pos(4)
+    ws.set_vert_split_pos(0)
 
     tmp = out_path + ".tmp"
-    try:
-        wb.save(tmp)
-    finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
+    wb.save(tmp)
 
     if os.path.exists(out_path):
         os.remove(out_path)
@@ -919,8 +802,6 @@ def split_by_groups(
         ):
             active_groups.append(grp)
 
-    excel_session = _ExcelSession()
-
     # ── кэш открытых исходных книг шаблонов ───────────────────
     # ОПТИМИЗАЦИЯ: раньше каждый шаблон-источник (ws_src) открывался
     # заново load_workbook() на КАЖДУЮ группу (десятки раз на один и
@@ -951,7 +832,6 @@ def split_by_groups(
 
             tpl_data  = entry["tpl_data"]
             rows      = entry["rows"]
-            style     = entry["style"]
             azs_sums  = entry["azs_sums"]
 
             net_code = suffix.split("_")[0]
@@ -965,19 +845,11 @@ def split_by_groups(
 
             ws_src = _get_ws_src(entry["ws_src_path"])
             base_name = f"{fi}_{suffix}_{grp}"
-
-            if win32_available:
-                tmp_xlsx = os.path.join(grp_dir, f"{base_name}_tmp.xlsx")
-                xls_path = os.path.join(grp_dir, f"{base_name}.xls")
-                _write_group_xlsx(tmp_xlsx, tpl_data, rows, keep_azs, style, ws_src)
-                ok = excel_session.convert(tmp_xlsx, xls_path)
-                file_name = f"{base_name}.xls" if ok else f"{base_name}_tmp.xlsx"
-            else:
-                file_name = f"{base_name}.xlsx"
-                _write_group_xlsx(
-                    os.path.join(grp_dir, file_name),
-                    tpl_data, rows, keep_azs, style, ws_src
-                )
+            file_name = f"{base_name}.xls"
+            _write_group_xls(
+                os.path.join(grp_dir, file_name),
+                tpl_data, rows, keep_azs, ws_src
+            )
 
             azs_names = [tpl_data["azs_headers"][i][1] for i in keep_azs]
             print(f"  [+] {suffix} / «{grp}»: {len(rows)} поз., {len(keep_azs)} АЗС "
@@ -989,8 +861,6 @@ def split_by_groups(
                 os.rmdir(grp_dir)
             except OSError:
                 pass
-
-    win32_available = excel_session._ensure()
 
     # ── 8. Записываем только нужные части ────────────────────
     last_dir = None
@@ -1016,8 +886,7 @@ def split_by_groups(
         else:
             last_dir = target_dir
 
-    # ── освобождаем ресурсы: Excel и кэш открытых шаблонов ────
-    excel_session.close()
+    # ── освобождаем ресурсы: кэш открытых шаблонов ────────────
     for wb_src in wb_src_cache.values():
         try:
             wb_src.close()
