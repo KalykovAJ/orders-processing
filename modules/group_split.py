@@ -206,8 +206,23 @@ def _write_group_xls(
         ws.write(3, total_out_col - 1, TEMPLATE_TOTAL_HEADER, style_builder.style_for_cell(src_total_header))
 
     # ── Строки данных ─────────────────────────────────────────
-    first_azs_letter = "E"
-    last_azs_letter = get_column_letter(4 + len(keep_azs_indices))
+    #
+    # ВАЖНО про колонку "ИТОГО": раньше здесь писалась формула Excel
+    # (=SUM(...)) через xlwt.Formula. Формат BIFF8, который использует
+    # xlwt, у формул всегда пишет "результат не вычислен" (см.
+    # xlwt.BIFFRecords.FormulaRecord — зашитый плейсхолдер
+    # 0xFFFF000000000003 вместо реального числа) — сам xlwt формулы не
+    # считает и закэшированное значение не сохраняет. Из-за этого при
+    # открытии файла Excel каждый раз принудительно пересчитывает лист
+    # и в результате считает книгу "изменённой", хотя пользователь
+    # ничего не редактировал. Отсюда и лишний процесс EXCEL.EXE,
+    # продолжающий висеть в диспетчере задач, и модалка "Сохранить
+    # изменения?" при закрытии/сворачивании окна в 1С.
+    #
+    # Мы уже знаем все значения строки на момент записи файла, поэтому
+    # вместо формулы сразу пишем готовое число — результат для
+    # пользователя визуально идентичен, а "грязного" пересчёта при
+    # открытии больше не происходит.
     blank_style = xlwt.XFStyle()
     for out_row, row_info in enumerate(group_rows, start=5):
         r0 = out_row - 1
@@ -218,24 +233,33 @@ def _write_group_xls(
             style = style_builder.style_for_cell(src_cell) if src_cell is not None else blank_style
             ws.write(r0, c_idx - 1, val, style)
 
+        total_value = 0.0
         for out_col, ai in enumerate(keep_azs_indices, start=5):
             orig_col_idx, _ = azs_headers[ai]
             val, src_cell = orig_cells.get(orig_col_idx, (None, None))
             style = style_builder.style_for_cell(src_cell) if src_cell is not None else blank_style
             ws.write(r0, out_col - 1, val, style)
+            if has_total:
+                # Сумма считается только по колонкам АЗС, реально попавшим в
+                # этот файл (а не по всем АЗС шаблона) — иначе цифра была бы
+                # некорректной для конкретной части/группы.
+                try:
+                    if val not in (None, ""):
+                        total_value += float(val)
+                except (TypeError, ValueError):
+                    pass
 
         if has_total:
-            # Сумма считается только по колонкам АЗС, реально попавшим в
-            # этот файл (а не по всем АЗС шаблона) — иначе цифра была бы
-            # некорректной для конкретной части/группы.
             _, src_total_cell = orig_cells.get(total_col_idx, (None, None))
-            formula = f"SUM({first_azs_letter}{out_row}:{last_azs_letter}{out_row})"
+            # int, если сумма целая (обычный случай для количества/веса) —
+            # чтобы формат "0" отображал число без хвоста ".0".
+            total_out_value = int(total_value) if total_value == int(total_value) else total_value
             if src_total_cell is not None:
                 style = style_builder.style_for_cell(src_total_cell, number_format_override="0")
             else:
                 style = xlwt.XFStyle()
                 style.num_format_str = "0"
-            ws.write(r0, total_out_col - 1, xlwt.Formula(formula), style)
+            ws.write(r0, total_out_col - 1, total_out_value, style)
 
     # ── Ширина колонок ────────────────────────────────────────
     for c_idx in range(1, 5):
