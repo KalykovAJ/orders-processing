@@ -15,9 +15,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config.settings import (
-    COL_NAME, COL_GROUP, COL_WEIGHT, COL_TOTAL, TEMPLATE_TOTAL_HEADER, get_style
+    COL_CODE, COL_NAME, COL_GROUP, COL_WEIGHT, COL_TOTAL, TEMPLATE_TOTAL_HEADER, get_style
 )
-from modules.reference import get_network_items
+from modules.reference import get_network_items, normalize_code, normalize_header
 from modules.network_detect import get_azs_files, parse_azs_number
 from modules.state import get_azs_hashes, save_azs_hashes
 
@@ -150,42 +150,68 @@ def _update_header_merge(ws, style: dict):
 
 def _fill_azs_column(ws, items_df: pd.DataFrame, azs_file: str,
                      col_idx: int, style: dict):
+    """Переносит количества из заявочника АЗС в колонку шаблона.
+
+    Сопоставление ведётся ПРЕЖДЕ ВСЕГО по коду товара (COL_CODE) —
+    он стабилен, в отличие от Наименования: справочник может
+    переименовать позицию, а заявочник на конкретной АЗС ещё не
+    обновлён и хранит старое название. Если у позиции нет кода (в
+    справочнике или в самом заявочнике колонка отсутствует/пуста) —
+    используется сопоставление по названию как раньше, чтобы не
+    терять такие позиции совсем.
+    """
     try:
         with pd.ExcelFile(azs_file) as xf:
             df_azs = xf.parse(xf.sheet_names[0], header=None)
 
         total_col_idx = None
         name_col_idx = None
+        code_col_idx = None
         header_row = None
+        target_total = normalize_header(COL_TOTAL)
+        target_name = normalize_header("Наименование")
+        target_code = normalize_header(COL_CODE)
         for ri, row in df_azs.iterrows():
             for ci, val in enumerate(row):
-                if str(val).strip() == COL_TOTAL:
+                cell_norm = normalize_header(val)
+                if cell_norm == target_total:
                     total_col_idx = ci
                     header_row = ri
-                if str(val).strip() == "Наименование":
+                if cell_norm == target_name:
                     name_col_idx = ci
+                if cell_norm == target_code:
+                    code_col_idx = ci
             if header_row is not None:
                 break
 
         if header_row is None or total_col_idx is None:
             return
 
-        data_map = {}
+        data_map_by_code = {}
+        data_map_by_name = {}
         for ri in range(header_row + 1, len(df_azs)):
             row = df_azs.iloc[ri]
             name = str(row.iloc[name_col_idx]).strip() if name_col_idx is not None else ""
-            qty = row.iloc[total_col_idx]
+            code = normalize_code(row.iloc[code_col_idx]) if code_col_idx is not None else ""
+            qty_raw = row.iloc[total_col_idx]
+            try:
+                qty = float(qty_raw) if pd.notna(qty_raw) else 0
+            except (TypeError, ValueError):
+                qty = 0
+            if code:
+                data_map_by_code[code] = qty
             if name and name not in ("nan", ""):
-                try:
-                    data_map[name] = float(qty) if pd.notna(qty) else 0
-                except (TypeError, ValueError):
-                    data_map[name] = 0
+                data_map_by_name[name] = qty
 
         r_fill = _fill(style["row_fill"])
         for ri, row in items_df.iterrows():
             r = ri + 5
+            item_code = str(row.get(COL_CODE, "")).strip()
             item_name = str(row.get(COL_NAME, "")).strip()
-            qty = data_map.get(item_name, 0)
+            if item_code and item_code in data_map_by_code:
+                qty = data_map_by_code[item_code]
+            else:
+                qty = data_map_by_name.get(item_name, 0)
             cell = ws.cell(row=r, column=col_idx, value=qty if qty else None)
             cell.fill = r_fill
             cell.alignment = _align()
@@ -194,35 +220,50 @@ def _fill_azs_column(ws, items_df: pd.DataFrame, azs_file: str,
         print(f"  [!] Ошибка заявочника {os.path.basename(azs_file)}: {e}")
 
 
-def _read_column_values_by_name(ws, col_idx: int, name_col: int = 2, start_row: int = 5) -> dict:
+def _item_key(code: str, name: str) -> str:
+    """Единый ключ позиции: код товара, если он есть, иначе название
+    (с префиксом, чтобы код "123" и название "123" не пересеклись
+    случайно)."""
+    if code:
+        return f"code:{code}"
+    return f"name:{name}"
+
+
+def _read_column_values_by_key(ws, col_idx: int, code_col: int = 1, name_col: int = 2,
+                                start_row: int = 5) -> dict:
     """Считывает текущие значения ячеек колонки col_idx, ключуя их по
-    названию товара из колонки name_col (обычно «Наименование», col=2) в
-    той же строке. Используется, чтобы перед пересборкой строк «снять
-    слепок» уже стоящих в шаблоне значений (в т.ч. правки, внесённые
-    пользователем вручную) по названию, а не по номеру строки — номер
-    строки как раз может при пересборке измениться."""
+    коду товара из колонки code_col (col=1, «Код») в той же строке —
+    с откатом на название (name_col=2), если код в этой строке шаблона
+    пуст. Используется, чтобы перед пересборкой строк «снять слепок»
+    уже стоящих в шаблоне значений (в т.ч. правки, внесённые
+    пользователем вручную) по устойчивому ключу, а не по номеру строки —
+    номер строки как раз может при пересборке измениться, а название
+    товара — измениться в справочнике (код при этом остаётся прежним)."""
     values = {}
     for r in range(start_row, ws.max_row + 1):
+        code_val = ws.cell(row=r, column=code_col).value
         name_val = ws.cell(row=r, column=name_col).value
+        code = normalize_code(code_val)
         name = str(name_val).strip() if name_val is not None else ""
-        if not name:
+        if not code and not name:
             continue
-        values[name] = ws.cell(row=r, column=col_idx).value
+        values[_item_key(code, name)] = ws.cell(row=r, column=col_idx).value
     return values
 
 
 def _write_azs_column_from_values(ws, items_df: pd.DataFrame, col_idx: int,
-                                   style: dict, values_by_name: dict):
-    """Записывает в колонку col_idx значения из values_by_name (снятые
-    ранее по названию товара), расставляя их по строкам в ТЕКУЩЕМ порядке
-    items_df. Товары, которых нет в values_by_name (новая позиция
+                                   style: dict, values_by_key: dict):
+    """Записывает в колонку col_idx значения из values_by_key (снятые
+    ранее по коду товара / названию), расставляя их по строкам в ТЕКУЩЕМ
+    порядке items_df. Товары, которых нет в values_by_key (новая позиция
     справочника), получают пустую ячейку — как и при обычном чтении из
     заявочника, где товар просто отсутствовал."""
     r_fill = _fill(style["row_fill"])
     for ri, row in items_df.iterrows():
         r = ri + 5
+        item_code = str(row.get(COL_CODE, "")).strip()
         item_name = str(row.get(COL_NAME, "")).strip()
-        val = values_by_name.get(item_name)
+        val = values_by_key.get(_item_key(item_code, item_name))
         cell = ws.cell(row=r, column=col_idx, value=val)
         cell.fill = r_fill
         cell.alignment = _align()
@@ -291,10 +332,11 @@ def _update_existing_template(
     единственную защиту.
 
     Перед пересборкой значения уже стоящих в шаблоне колонок АЗС
-    «снимаются» по названию товара (_read_column_values_by_name), а не по
-    номеру строки — благодаря этому ручные правки пользователя,
-    внесённые прямо в ячейки шаблона, переживают пересборку строк и
-    переносятся на новую позицию строки того же товара
+    «снимаются» по коду товара, с откатом на название, если код пуст
+    (_read_column_values_by_key), а не по номеру строки — благодаря
+    этому ручные правки пользователя, внесённые прямо в ячейки шаблона,
+    переживают пересборку строк и переименование позиции в справочнике,
+    и переносятся на новую позицию строки того же товара
     (_write_azs_column_from_values). Единственное исключение — колонки,
     чей файл заявки реально изменился на диске (см. changed_files): для
     них данные перечитываются заново из файла, затирая то, что было
@@ -343,7 +385,7 @@ def _update_existing_template(
     # ── снимаем слепок текущих значений колонок АЗС по названию товара
     # (нужно сделать ДО того, как строки/колонки будут снесены) ────
     old_values_by_header: dict = {
-        h: _read_column_values_by_name(ws, existing_azs[h])
+        h: _read_column_values_by_key(ws, existing_azs[h])
         for h in kept_headers
     }
 
@@ -552,7 +594,7 @@ def _write_header(ws, network_code: str, style: dict, items_df: pd.DataFrame):
     ws["A1"].alignment = _align(h="left")
 
     col_h_fill = _fill(style["col_header_fill"])
-    for ci, h in enumerate(["№", COL_NAME, COL_GROUP, COL_WEIGHT], start=1):
+    for ci, h in enumerate(["Код", COL_NAME, COL_GROUP, COL_WEIGHT], start=1):
         cell = ws.cell(row=4, column=ci, value=h)
         cell.fill = col_h_fill
         cell.font = _font(style["col_header_font"], bold=True)
@@ -560,7 +602,7 @@ def _write_header(ws, network_code: str, style: dict, items_df: pd.DataFrame):
 
     for ri, row in items_df.iterrows():
         r = ri + 5
-        ws.cell(row=r, column=1, value=ri + 1).alignment = _align()
+        ws.cell(row=r, column=1, value=row.get(COL_CODE, "")).alignment = _align()
         ws.cell(row=r, column=2, value=row.get(COL_NAME, "")).alignment = _align(h="left")
         ws.cell(row=r, column=3, value=row.get(COL_GROUP, "")).alignment = _align()
         ws.cell(row=r, column=4, value=row.get(COL_WEIGHT, "")).alignment = _align()

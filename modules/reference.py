@@ -5,9 +5,35 @@ import os
 import pandas as pd
 from config.settings import (
     REFERENCE_DIR, EXCLUDE_STATUS, EXCLUDE_ORDER,
-    COL_NAME, COL_GROUP, COL_WEIGHT, COL_STATUS, COL_ORDER, COL_WAREHOUSE,
+    COL_CODE, COL_NAME, COL_GROUP, COL_WEIGHT, COL_STATUS, COL_ORDER, COL_WAREHOUSE,
     NON_FOOD_WAREHOUSE
 )
+
+
+def normalize_code(val) -> str:
+    """Приводит код товара к единому строковому виду, чтобы 505, 505.0,
+    '505', ' 505 ', а также '4 073' (код с пробелом-разделителем разрядов,
+    как иногда вставляет Excel/человек) и '4073' считались одним и тем же
+    кодом. Используется и при чтении справочника, и при чтении
+    заявочников АЗС, чтобы код товара оставался устойчивым ключом
+    сопоставления даже если в справочнике сменилось Наименование, а в
+    заявочнике на АЗС осталось старое (не все сети/АЗС обновляются
+    одновременно)."""
+    if val is None:
+        return ""
+    if isinstance(val, float):
+        if val != val:  # NaN
+            return ""
+        return str(int(val)) if val.is_integer() else str(val).strip()
+    s = str(val)
+    s = "".join(s.split())  # убирает ВСЕ пробелы (обычные, \xa0, \t и т.п.), не только по краям
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    return str(int(f)) if f.is_integer() else s
 
 
 def _normalize(val) -> str:
@@ -23,14 +49,29 @@ def _normalize(val) -> str:
     return s.strip().lower()
 
 
+def normalize_header(val) -> str:
+    """Нормализует заголовок колонки для сравнения: убирает ВСЕ пробельные
+    символы целиком (а не просто схлопывает повторы, как _normalize) и
+    приводит к нижнему регистру. Это нужно, чтобы «Код товара»,
+    «код  товара», «КОД ТОВАРА» и слитное «Кодтовара» считались одним и
+    тем же заголовком — реестры/заявочники разных сетей и разных людей
+    оформлены не всегда одинаково."""
+    if pd.isna(val):
+        return ""
+    s = str(val)
+    s = "".join(s.split())  # убирает вообще все пробелы, \t, \n, \xa0 и т.п.
+    return s.strip().lower()
+
+
 def _find_col(df: pd.DataFrame, col_name: str):
     """
-    Ищет колонку без учёта регистра и лишних пробелов.
+    Ищет колонку без учёта регистра и пробелов (в т.ч. слитного/раздельного
+    написания, лишних пробелов, неразрывных пробелов).
     Возвращает реальное название колонки в df, или None.
     """
-    target = _normalize(col_name)
+    target = normalize_header(col_name)
     for c in df.columns:
-        if _normalize(c) == target:
+        if normalize_header(c) == target:
             return c
     return None
 
@@ -110,7 +151,7 @@ def get_network_items(refs: dict, network_code: str, category: str = None) -> pd
 
     # Собираем нужные колонки
     res_cols = {}
-    for global_name, target in [("name", COL_NAME), ("group", COL_GROUP), ("weight", COL_WEIGHT)]:
+    for global_name, target in [("code", COL_CODE), ("name", COL_NAME), ("group", COL_GROUP), ("weight", COL_WEIGHT)]:
         real_c = _find_col(df, target)
         if real_c:
             res_cols[global_name] = df[real_c]
@@ -123,12 +164,14 @@ def get_network_items(refs: dict, network_code: str, category: str = None) -> pd
                 res_cols[global_name] = ""
 
     new_df = pd.DataFrame({
+        COL_CODE: res_cols["code"],
         COL_NAME: res_cols["name"],
         COL_GROUP: res_cols["group"],
         COL_WEIGHT: res_cols["weight"]
     })
 
     # Очистка данных
+    new_df[COL_CODE] = new_df[COL_CODE].apply(normalize_code)
     new_df[COL_NAME] = new_df[COL_NAME].astype(str).str.strip()
     new_df[COL_GROUP] = new_df[COL_GROUP].fillna("Общий").astype(str).str.strip()
     new_df[COL_WEIGHT] = pd.to_numeric(new_df[COL_WEIGHT], errors='coerce').fillna(0.0)
