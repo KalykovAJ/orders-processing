@@ -93,20 +93,104 @@ def calculate_tonnage(root_folder: str, network_templates: dict):
     grand_total = sum(network_totals.values())
     max_rows = max((len(v) for v in all_azs_per_net.values()), default=0)
 
-    # --- Единая ширина колонок: учитываем и название сети (чтобы не выходило за рамку), и сами значения ---
-    uniform_width = 14
-    for net_code in ordered_nets:
-        style = get_style(net_code)
-        needed_for_name = (len(style["full_name"]) / 2) + 2  # имя сети делится на 2 колонки
-        uniform_width = max(uniform_width, needed_for_name)
-        for azs in all_azs_per_net[net_code]:
-            label = _short_label(net_code, azs)
-            uniform_width = max(uniform_width, len(label) + 2)
-    uniform_width = min(uniform_width, 14)  # чтобы таблица не "расползалась" при печати
+    # --- Ширина колонок и высота строк ---
+    #
+    # ВАЖНО: Excel переносит текст с wrap_text ПО ГРАНИЦАМ СЛОВ (по
+    # пробелам), а не просто "когда закончилось место в строке по счёту
+    # символов". Например, "СМ Бойтик" — это два слова: если после "СМ "
+    # не остаётся места под "Бойтик" целиком, перенос произойдёт именно
+    # после "СМ", независимо от того, сколько символов теоретически могло
+    # бы поместиться. Поэтому вместо деления общей длины строки на
+    # "символов на строку" ниже честно симулируется перенос по словам —
+    # так же, как это делает сам Excel.
+    #
+    # Ширина колонки в Excel хранится в "единицах символа шрифта по
+    # умолчанию" (обычно Calibri 11), а не символах реального шрифта
+    # ячейки (у нас Arial 16, где символ заметно шире) — поэтому ширина
+    # переводится в пиксели по стандартной формуле Excel (px = units*7+5)
+    # и уже в пикселях сравнивается с шириной текста в реальном шрифте.
+    PX_PER_UNIT = 7
+    UNIT_PADDING_PX = 5
+    CELL_PADDING_PX = 8      # внутренние отступы ячейки
+    CHAR_PX_FACTOR = 0.78    # ширина символа Arial/кириллица (с запасом, чтобы не занижать)
+    HEIGHT_SAFETY_PT = 4     # небольшой запас в points на неточность оценки ширины
+
+    def _char_px(font_size: float) -> float:
+        return font_size * CHAR_PX_FACTOR
+
+    def _text_width_px(text: str, font_size: float) -> float:
+        return len(str(text)) * _char_px(font_size)
+
+    def _px_to_width_units(px: float) -> float:
+        return max(1.0, (px - UNIT_PADDING_PX) / PX_PER_UNIT)
+
+    def _avail_px(width_units: float) -> float:
+        return max(1.0, width_units * PX_PER_UNIT + UNIT_PADDING_PX - CELL_PADDING_PX)
+
+    def _wrap_word_count(text: str, avail_px: float, font_size: float) -> int:
+        """Симулирует перенос текста ПО СЛОВАМ в доступной ширине avail_px
+        и возвращает реальное число строк — так же, как это делает Excel
+        с wrap_text=True (а не по грубому счёту символов на строку)."""
+        words = str(text).split(" ")
+        if not words:
+            return 1
+        lines = 1
+        cur_width = 0.0
+        space_px = _char_px(font_size) * 0.5
+        for i, word in enumerate(words):
+            word_px = _text_width_px(word, font_size)
+            add_px = word_px if cur_width == 0 else space_px + word_px
+            if cur_width + add_px <= avail_px or cur_width == 0:
+                cur_width += add_px
+            else:
+                lines += 1
+                cur_width = word_px
+        return lines
+
+    # Для расчёта ШИРИНЫ колонки берём ширину текста с небольшим запасом
+    # (15%) — чтобы реальный рендер Arial в Excel (который может немного
+    # отличаться от нашей оценки) комфортно помещался, не впритык.
+    WIDTH_SAFETY_MULT = 1.15
+    # Для расчёта ВЫСОТЫ строки (сколько строк займёт текст при переносе)
+    # берём почти всю доступную ширину колонки (92%), а не всю целиком —
+    # небольшой запас на случай неточности, но не настолько агрессивный,
+    # чтобы обычные короткие названия ошибочно считались "переносящимися"
+    # и раздували высоту строки без необходимости.
+    HEIGHT_AVAIL_FACTOR = 0.92
+
+    def _lines_needed(text: str, col_width_units: float, font_size: float) -> int:
+        if not text:
+            return 1
+        avail_for_height = _avail_px(col_width_units) * HEIGHT_AVAIL_FACTOR
+        return max(1, _wrap_word_count(str(text), avail_for_height, font_size))
+
+    WEIGHT_COL_WIDTH = 9
+    MIN_NAME_COL_WIDTH = 12
+    MAX_NAME_COL_WIDTH = 28  # верхний предел, чтобы таблица не "расползалась" при печати
 
     title_font_size = 18
     header_font_size = 16
     data_font_size = 16
+    # Высота одной строки текста в points при data_font_size, плюс
+    # запасная "полу-строка" на случай, если реальный рендер Excel/шрифта
+    # окажется чуть шире нашей оценки — лучше строка будет на пару
+    # пунктов выше нужного, чем текст обрежется снизу.
+    LINE_HEIGHT = round(data_font_size * 1.3)
+
+    # --- Ширина колонки названия АЗС/магазина — под самую длинную метку
+    # этой сети (а не под название сети в шапке — оно должно просто
+    # переноситься на 2 строки, как уже происходит у "Партнер Нефть",
+    # а не раздувать колонку под себя, если названия АЗС короткие) ---
+    name_col_width = {}
+    for net_code in ordered_nets:
+        needed = MIN_NAME_COL_WIDTH
+        for azs in all_azs_per_net[net_code]:
+            label = _short_label(net_code, azs)
+            label_px = _text_width_px(label, data_font_size) * WIDTH_SAFETY_MULT + CELL_PADDING_PX
+            needed = max(needed, _px_to_width_units(label_px))
+        name_col_width[net_code] = min(needed, MAX_NAME_COL_WIDTH)
+
+
 
     tmp_path = out_path + ".tmp"
     wb_out = Workbook()
@@ -130,6 +214,7 @@ def calculate_tonnage(root_folder: str, network_templates: dict):
         ws_out.row_dimensions[1].height = 28
 
         # --- Заголовки сетей ---
+        header_lines = 1
         for net_code in ordered_nets:
             style = get_style(net_code)
             c1, c2 = col_map[net_code]
@@ -140,9 +225,28 @@ def calculate_tonnage(root_folder: str, network_templates: dict):
             cell.fill = _fill(style["header_fill"])
             cell.font = _font(style["header_font"], bold=True, size=header_font_size)
             cell.alignment = _align()
-        ws_out.row_dimensions[2].height = 36
+            merged_width = name_col_width[net_code] + WEIGHT_COL_WIDTH
+            header_lines = max(header_lines, _lines_needed(style["full_name"], merged_width, header_font_size))
+        # высота шапки — под самое длинное название сети, которое теперь
+        # переносится на нужное число строк (колонка сужена под реальные
+        # данные АЗС, а не под название сети)
+        HEADER_LINE_HEIGHT = round(header_font_size * 1.3)
+        ws_out.row_dimensions[2].height = max(36, header_lines * HEADER_LINE_HEIGHT + HEIGHT_SAFETY_PT)
 
         # --- Данные по АЗС ---
+        # Высота строки данных ОДНА НА ВСЕ строки (не пересчитывается для
+        # каждой строки отдельно) — иначе из-за небольших различий в
+        # оценке ширины шрифта соседние строки получали разную высоту,
+        # хотя весь текст в них умещался в одну строку. Берём максимум
+        # по ВСЕЙ таблице один раз — так высота гарантированно достаточна
+        # для самой длинной метки и при этом одинакова для всех строк.
+        global_max_lines = 1
+        for net_code in ordered_nets:
+            for azs in all_azs_per_net[net_code]:
+                label = _short_label(net_code, azs)
+                global_max_lines = max(global_max_lines, _lines_needed(label, name_col_width[net_code], data_font_size))
+        data_row_height = max(20, global_max_lines * LINE_HEIGHT + HEIGHT_SAFETY_PT)
+
         for row_i in range(max_rows):
             r = row_i + 3
             for net_code in ordered_nets:
@@ -162,7 +266,7 @@ def calculate_tonnage(root_folder: str, network_templates: dict):
                         cell.font = _font(style["row_font"], size=data_font_size)
                         cell.alignment = _align()
                     cell_wt.number_format = "0"
-            ws_out.row_dimensions[r].height = 20
+            ws_out.row_dimensions[r].height = data_row_height
 
         # --- Итог по каждой сети (формула — пересчитывается при ручных правках) ---
         total_row = max_rows + 3
@@ -220,9 +324,12 @@ def calculate_tonnage(root_folder: str, network_templates: dict):
         gt_cell.number_format = "0"
         ws_out.row_dimensions[grand_row].height = 24
 
-        # --- Единая ширина всех колонок АЗС/Вес ---
-        for col_idx in range(1, last_col_idx + 1):
-            ws_out.column_dimensions[get_column_letter(col_idx)].width = uniform_width
+        # --- Ширина колонок: у каждой сети своя ширина под названия АЗС/
+        # магазинов, колонка веса везде узкая ---
+        for net_code in ordered_nets:
+            c_azs, c_wt = col_map[net_code]
+            ws_out.column_dimensions[get_column_letter(c_azs)].width = name_col_width[net_code]
+            ws_out.column_dimensions[get_column_letter(c_wt)].width = WEIGHT_COL_WIDTH
 
         # --- Границы таблицы ---
         border_obj = _thin_border()

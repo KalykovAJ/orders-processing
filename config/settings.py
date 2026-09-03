@@ -117,6 +117,16 @@ NETWORK_STYLES = {
         "row_fill":        "ECEFF4",   # светло-розовый
         "row_font":        "000000",
     },
+        # Sky Market
+    "SM": {
+        "full_name":       "Sky Market",
+        "header_fill":     "8D54EA",   # тёмно-красный
+        "header_font":     "FEFFFF",
+        "col_header_fill": "F8309E",   # средне-красный
+        "col_header_font": "FEFFFF",
+        "row_fill":        "FFE5FE",   # светло-розовый
+        "row_font":        "000000",
+    },
     # Шаблон по умолчанию для новых сетей
     "_default": {
         "full_name":       "Сеть",
