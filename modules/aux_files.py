@@ -36,7 +36,7 @@ def _get_azs_sheet_names_by_net(root_folder: str, network_mapping: dict, selecte
                     base = base[:-1].strip()
 
             base_clean = re.sub(rf'^{re.escape(net_code)}\s*', '', base, flags=re.IGNORECASE).strip()
-            sheet_name = f"{net_code}{base_clean}"[:31]
+            sheet_name = f"{net_code} {base_clean}"[:31]
             names.add(sheet_name)
 
         if names:
