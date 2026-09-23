@@ -6,9 +6,14 @@ import pandas as pd
 from config.settings import (
     REFERENCE_DIR, EXCLUDE_STATUS, EXCLUDE_ORDER,
     COL_CODE, COL_NAME, COL_GROUP, COL_WEIGHT, COL_STATUS, COL_ORDER, COL_WAREHOUSE,
-    NON_FOOD_WAREHOUSE
+    NON_FOOD_WAREHOUSE, ZERO_QTY_ORDER_VALUES
 )
 
+
+
+# Технический столбец items_df — не выводится в шаблон, используется
+# только внутри build_template для подавления переноса количества.
+ZERO_QTY_FLAG_COL = "_zero_qty"
 
 def normalize_code(val) -> str:
     """Приводит код товара к единому строковому виду, чтобы 505, 505.0,
@@ -149,6 +154,15 @@ def get_network_items(refs: dict, network_code: str, category: str = None) -> pd
                 lambda x: _normalize(x) != _normalize(NON_FOOD_WAREHOUSE)
             )]
 
+    # Флаг "заказ по центру": товар остаётся в шаблоне, но количество
+    # из заявочника АЗС по нему переноситься не должно (см. build_template).
+    real_order = _find_col(df, COL_ORDER)
+    if real_order:
+        zero_qty_norm = {_normalize(v) for v in ZERO_QTY_ORDER_VALUES}
+        zero_qty_flags = df[real_order].apply(lambda x: _normalize(x) in zero_qty_norm)
+    else:
+        zero_qty_flags = pd.Series(False, index=df.index)
+
     # Собираем нужные колонки
     res_cols = {}
     for global_name, target in [("code", COL_CODE), ("name", COL_NAME), ("group", COL_GROUP), ("weight", COL_WEIGHT)]:
@@ -167,7 +181,8 @@ def get_network_items(refs: dict, network_code: str, category: str = None) -> pd
         COL_CODE: res_cols["code"],
         COL_NAME: res_cols["name"],
         COL_GROUP: res_cols["group"],
-        COL_WEIGHT: res_cols["weight"]
+        COL_WEIGHT: res_cols["weight"],
+        ZERO_QTY_FLAG_COL: zero_qty_flags,
     })
 
     # Очистка данных

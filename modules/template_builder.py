@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 from config.settings import (
     COL_CODE, COL_NAME, COL_GROUP, COL_WEIGHT, COL_TOTAL, TEMPLATE_TOTAL_HEADER, get_style
 )
-from modules.reference import get_network_items, normalize_code, normalize_header
+from modules.reference import get_network_items, normalize_code, normalize_header, ZERO_QTY_FLAG_COL
 from modules.network_detect import get_azs_files, parse_azs_number
 from modules.state import get_azs_hashes, save_azs_hashes
 
@@ -208,7 +208,11 @@ def _fill_azs_column(ws, items_df: pd.DataFrame, azs_file: str,
             r = ri + 5
             item_code = str(row.get(COL_CODE, "")).strip()
             item_name = str(row.get(COL_NAME, "")).strip()
-            if item_code and item_code in data_map_by_code:
+            if row.get(ZERO_QTY_FLAG_COL, False):
+                # Заказ "по центру": товар в шаблоне остаётся,
+                # но количество из заявочника не переносится.
+                qty = 0
+            elif item_code and item_code in data_map_by_code:
                 qty = data_map_by_code[item_code]
             else:
                 qty = data_map_by_name.get(item_name, 0)
@@ -263,7 +267,13 @@ def _write_azs_column_from_values(ws, items_df: pd.DataFrame, col_idx: int,
         r = ri + 5
         item_code = str(row.get(COL_CODE, "")).strip()
         item_name = str(row.get(COL_NAME, "")).strip()
-        val = values_by_key.get(_item_key(item_code, item_name))
+        if row.get(ZERO_QTY_FLAG_COL, False):
+            # То же правило действует и при переносе старых значений —
+            # это свойство товара, а не конкретного файла/колонки, и
+            # не должно зависеть от того, менялась заявка или нет.
+            val = None
+        else:
+            val = values_by_key.get(_item_key(item_code, item_name))
         cell = ws.cell(row=r, column=col_idx, value=val)
         cell.fill = r_fill
         cell.alignment = _align()
