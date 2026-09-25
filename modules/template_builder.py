@@ -261,19 +261,21 @@ def _write_azs_column_from_values(ws, items_df: pd.DataFrame, col_idx: int,
     ранее по коду товара / названию), расставляя их по строкам в ТЕКУЩЕМ
     порядке items_df. Товары, которых нет в values_by_key (новая позиция
     справочника), получают пустую ячейку — как и при обычном чтении из
-    заявочника, где товар просто отсутствовал."""
+    заявочника, где товар просто отсутствовал.
+
+    ВАЖНО: флаг "заказ по центру" (ZERO_QTY_FLAG_COL) здесь намеренно
+    НЕ проверяется. Эта функция переносит значения, уже стоящие в
+    шаблоне, — включая ручные правки пользователя. Обнулять их нельзя:
+    правило "не переносить количество от АЗС" касается только данных,
+    ПРИХОДЯЩИХ из заявочника (см. _fill_azs_column), а не того, что
+    сотрудник вписал в файл вручную.
+    """
     r_fill = _fill(style["row_fill"])
     for ri, row in items_df.iterrows():
         r = ri + 5
         item_code = str(row.get(COL_CODE, "")).strip()
         item_name = str(row.get(COL_NAME, "")).strip()
-        if row.get(ZERO_QTY_FLAG_COL, False):
-            # То же правило действует и при переносе старых значений —
-            # это свойство товара, а не конкретного файла/колонки, и
-            # не должно зависеть от того, менялась заявка или нет.
-            val = None
-        else:
-            val = values_by_key.get(_item_key(item_code, item_name))
+        val = values_by_key.get(_item_key(item_code, item_name))
         cell = ws.cell(row=r, column=col_idx, value=val)
         cell.fill = r_fill
         cell.alignment = _align()
